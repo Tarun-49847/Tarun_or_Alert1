@@ -38,7 +38,7 @@ SEARCH_QUERIES = [
 ]
 
 # Lookback window. With a 10-minute cron, r1800 (30 min) gives a 3x overlap.
-TIME_WINDOW = "r1800"        # seconds; r900=15min, r1800=30min, r3600=1h
+TIME_WINDOW = "r86400"        # seconds; r900=15min, r1800=30min, r3600=1h
 PAGES_PER_QUERY = 2          # 25 results per page
 MAX_ALERTS_PER_RUN = 25      # safety valve if the cache is ever cleared
 
