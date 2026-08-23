@@ -1,174 +1,249 @@
+#!/usr/bin/env python3
+"""
+LinkedIn job alert -> Telegram
+  - Multiple search queries (coverage), deduped via seen_jobs.json
+  - f_TPR lookback window OVERLAPS the cron interval so queue delays never drop jobs
+  - Word-boundary regex include/exclude filtering (no substring false hits)
+  - Phrase-based excludes so "Sales Tax Analyst" survives a "sales executive" block
+  - seen_jobs.json pruning so the cache doesn't grow forever
+  - Retry/backoff + polite pacing to avoid LinkedIn 429s
+"""
+
 import json
 import os
+import re
+import sys
 import time
-from urllib.parse import quote_plus
+from datetime import datetime, timezone
+
 import requests
 from bs4 import BeautifulSoup
 
-# ================= SEARCH CONFIGURATION =================
-SEARCH_QUERIES = [
-    '"Accounts Receivable"',
-    '"AR Analyst"',
-    '"AR Specialist"',
-    '"Billing Specialist"',
-    '"Finance Associate"',
-    '"Financial Analyst"',
-    '"Order to Cash"',
-    '"Credit and Collections"',
-    '"Cash Applications"',
-]
+# ---------------------------------------------------------------- config ---
 
 LOCATION = "Bengaluru, Karnataka, India"
 
-# Whitelist: The actual job title MUST contain at least one of these words
-ALLOWED_TITLE_KEYWORDS = [
-    "receivable",
-    "ar ",
-    " ar",
-    "billing",
-    "financial",
-    "finance",
-    "collections",
-    "collection",
+# Each query is a separate LinkedIn search. Keep them short & specific.
+SEARCH_QUERIES = [
+    "accounts receivable",
     "order to cash",
-    "o2c",
-    "cash app",
-    "invoicing",
-    "accountant",
-    "accounting",
+    "billing analyst",
+    "credit control",
+    "collections analyst",
+    "cash application",
+    "revenue accountant",
+    "finance analyst",
+    "invoice to cash",
+    "indirect tax",          # remove if you don't want tax roles
 ]
 
-# Blacklist: Reject any job title containing these words
-BLOCKED_TITLE_KEYWORDS = [
-    "sales",
-    "business development",
-    "bde",
-    "real estate",
-    "banquet",
-    "chef",
-    "developer",
-    "software",
-    "itsm",
-    "engineer",
-    "marketing",
-    "recruiter",
-    "hr ",
-    "hospitality",
+# Lookback window. With a 10-minute cron, r1800 (30 min) gives a 3x overlap.
+TIME_WINDOW = "r1800"        # seconds; r900=15min, r1800=30min, r3600=1h
+PAGES_PER_QUERY = 2          # 25 results per page
+MAX_ALERTS_PER_RUN = 25      # safety valve if the cache is ever cleared
+
+SEEN_FILE = "seen_jobs.json"
+SEEN_MAX_AGE_DAYS = 45
+
+# --- Title filtering --------------------------------------------------------
+# A title passes if it matches >=1 INCLUDE pattern and 0 EXCLUDE patterns.
+# All patterns are case-insensitive regex with word boundaries.
+
+INCLUDE_PATTERNS = [
+    r"\breceivables?\b",
+    r"\ba\.?r\.?\b",                      # AR / A.R. as a whole word only
+    r"\bbilling\b",
+    r"\bo2c\b|\botc\b|\border[- ]to[- ]cash\b|\binvoice[- ]to[- ]cash\b",
+    r"\bcollections?\b",
+    r"\bcredit\s+control(ler)?\b",
+    r"\binvoic(e|ing)\b",
+    r"\bcash\s+application\b",
+    r"\brevenue\s+(accountant|analyst|assurance|operations)\b",
+    r"\bfinanc(e|ial)\s+(analyst|executive|operations)\b",
+    r"\baccounts?\s+(executive|analyst|officer)\b",
+    r"\b(indirect|sales|us)\s+tax\b",     # tax roles; delete line to disable
+    r"\brecord\s+to\s+report\b|\br2r\b",  # adjacent; delete if unwanted
 ]
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-HISTORY_FILE = "seen_jobs.json"
-# ========================================================
+# Phrase-based excludes. Deliberately NOT bare words like "sales" or "credit",
+# which would kill "Sales Tax Analyst" or "Credit Controller".
+EXCLUDE_PATTERNS = [
+    r"\bsales\s+(executive|manager|officer|representative|associate|development)\b",
+    r"\bbusiness\s+development\b",
+    r"\bsoftware\b|\bdeveloper\b|\bengineer(ing)?\b|\bsre\b|\bdevops\b",
+    r"\bitsm\b|\bservicenow\b|\bsupport\s+engineer\b",
+    r"\breal\s+estate\b|\bbanquet\b|\bhospitality\b|\bchef\b|\bhotel\b",
+    r"\bar\s+caller\b|\bvoice\s+process\b|\bmedical\s+billing\b|\bbpo\b",
+    r"\btele\s*(caller|sales|marketing)\b",
+    r"\bintern(ship)?\b",                 # remove if internships are OK
+    r"\brecruit(er|ment)\b|\bhr\b",
+    r"\baccounts?\s+payable\b|\bp2p\b|\bprocure[- ]to[- ]pay\b",  # AP side
+]
+
+INCLUDE_RE = [re.compile(p, re.I) for p in INCLUDE_PATTERNS]
+EXCLUDE_RE = [re.compile(p, re.I) for p in EXCLUDE_PATTERNS]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 
 
-def send_telegram_alert(title, company, location, link, keyword):
-  message = (
-      f"🚨 *New Matching Job ({keyword})!*\n\n"
-      f"📌 *Role:* {title}\n"
-      f"🏢 *Company:* {company}\n"
-      f"📍 *Location:* {location}\n\n"
-      f"🔗 [Apply Here]({link})"
-  )
-  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-  payload = {
-      "chat_id": TELEGRAM_CHAT_ID,
-      "text": message,
-      "parse_mode": "Markdown",
-  }
-  try:
-    requests.post(url, json=payload, timeout=10)
-  except Exception as e:
-    print(f"Failed to send Telegram alert: {e}")
+# ---------------------------------------------------------------- helpers ---
+
+def title_passes(title: str) -> bool:
+    t = " ".join(title.split())
+    if any(rx.search(t) for rx in EXCLUDE_RE):
+        return False
+    return any(rx.search(t) for rx in INCLUDE_RE)
 
 
-def load_seen_jobs():
-  if os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "r") as f:
-      try:
-        return set(json.load(f))
-      except Exception:
-        return set()
-  return set()
+def load_seen() -> dict:
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE) as f:
+            data = json.load(f)
+        # migrate old list-format caches
+        if isinstance(data, list):
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            data = {jid: today for jid in data}
+        return data
+    return {}
 
 
-def save_seen_jobs(seen_ids):
-  with open(HISTORY_FILE, "w") as f:
-    json.dump(list(seen_ids), f)
+def save_seen(seen: dict) -> None:
+    cutoff = datetime.now(timezone.utc).timestamp() - SEEN_MAX_AGE_DAYS * 86400
+    pruned = {}
+    for jid, ds in seen.items():
+        try:
+            ts = datetime.strptime(ds, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            ts = 0
+        if ts >= cutoff:
+            pruned[jid] = ds
+    with open(SEEN_FILE, "w") as f:
+        json.dump(pruned, f, indent=0, sort_keys=True)
 
 
-def is_relevant_role(title):
-  title_lower = title.lower()
+def fetch_page(query: str, start: int):
+    params = {
+        "keywords": query,
+        "location": LOCATION,
+        "f_TPR": TIME_WINDOW,
+        "start": start,
+        "sortBy": "DD",  # date descending
+    }
+    for attempt in range(3):
+        try:
+            r = requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=20)
+            if r.status_code == 200:
+                return r.text
+            if r.status_code == 429:
+                time.sleep(15 * (attempt + 1))
+                continue
+            if r.status_code == 400:   # start beyond available results
+                return ""
+        except requests.RequestException:
+            time.sleep(5 * (attempt + 1))
+    return ""
 
-  # 1. Reject if title matches blacklist
-  if any(blocked in title_lower for blocked in BLOCKED_TITLE_KEYWORDS):
+
+def parse_jobs(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
+    jobs = []
+    for card in soup.select("div.base-card, li"):
+        urn = card.get("data-entity-urn") or ""
+        a = card.select_one("a.base-card__full-link") or card.select_one("a[href*='/jobs/view/']")
+        title_el = card.select_one("h3.base-search-card__title")
+        company_el = card.select_one("h4.base-search-card__subtitle")
+        loc_el = card.select_one("span.job-search-card__location")
+        time_el = card.select_one("time")
+        if not (a and title_el):
+            continue
+        link = a.get("href", "").split("?")[0]
+        job_id = urn.split(":")[-1] if urn else (
+            re.search(r"/jobs/view/[^/]*?(\d+)", link).group(1)
+            if re.search(r"/jobs/view/[^/]*?(\d+)", link) else link
+        )
+        jobs.append({
+            "id": job_id,
+            "title": title_el.get_text(strip=True),
+            "company": company_el.get_text(strip=True) if company_el else "?",
+            "location": loc_el.get_text(strip=True) if loc_el else "",
+            "posted": time_el.get_text(strip=True) if time_el else "",
+            "link": link,
+        })
+    return jobs
+
+
+def send_telegram(text: str) -> bool:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(3):
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code == 200:
+            return True
+        if r.status_code == 429:
+            retry = r.json().get("parameters", {}).get("retry_after", 5)
+            time.sleep(retry + 1)
+            continue
+        time.sleep(3)
     return False
 
-  # 2. Accept if title matches whitelist
-  if any(allowed in title_lower for allowed in ALLOWED_TITLE_KEYWORDS):
-    return True
 
-  return False
+# ------------------------------------------------------------------- main ---
 
+def main():
+    seen = load_seen()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    collected, filtered_out = {}, 0
 
-def check_all_roles():
-  seen_jobs = load_seen_jobs()
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/124.0.0.0 Safari/537.36"
-      )
-  }
+    for query in SEARCH_QUERIES:
+        for page in range(PAGES_PER_QUERY):
+            html_text = fetch_page(query, page * 25)
+            if not html_text:
+                break
+            page_jobs = parse_jobs(html_text)
+            if not page_jobs:
+                break
+            for job in page_jobs:
+                if job["id"] in seen or job["id"] in collected:
+                    continue
+                if not title_passes(job["title"]):
+                    filtered_out += 1
+                    seen[job["id"]] = today   # don't re-evaluate noise next run
+                    continue
+                collected[job["id"]] = job
+            time.sleep(2)  # be polite between requests
 
-  for query in SEARCH_QUERIES:
-    url = (
-        f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
-        f"keywords={quote_plus(query)}&location={quote_plus(LOCATION)}&f_TPR=r3600&sortBy=DD"
-    )
+    new_jobs = list(collected.values())[:MAX_ALERTS_PER_RUN]
+    print(f"queries={len(SEARCH_QUERIES)} new={len(new_jobs)} filtered={filtered_out}")
 
-    try:
-      response = requests.get(url, headers=headers, timeout=15)
-      if response.status_code != 200:
-        continue
-
-      soup = BeautifulSoup(response.text, "html.parser")
-      job_cards = soup.find_all("li")
-
-      for card in job_cards:
-        link_elem = card.find("a", class_="base-card__full-link")
-        title_elem = card.find("h3", class_="base-search-card__title")
-        company_elem = card.find("h4", class_="base-search-card__subtitle")
-        location_elem = card.find("span", class_="job-search-card__location")
-
-        if not link_elem or not title_elem:
-          continue
-
-        title = title_elem.text.strip()
-        job_url = link_elem.get("href", "").split("?")[0]
-        job_id = (
-            job_url.split("-")[-1] if "-" in job_url else job_url.split("/")[-1]
+    import html as html_mod
+    for job in new_jobs:
+        msg = (
+            f"<b>{html_mod.escape(job['title'])}</b>\n"
+            f"{html_mod.escape(job['company'])} — {html_mod.escape(job['location'])}\n"
+            f"Posted: {html_mod.escape(job['posted'])}\n"
+            f"<a href=\"{job['link']}\">Apply on LinkedIn</a>"
         )
+        if send_telegram(msg):
+            seen[job["id"]] = today
+        time.sleep(1.2)  # Telegram rate limit headroom
 
-        # Check if job is new and matches role filter
-        if job_id not in seen_jobs:
-          if is_relevant_role(title):
-            company = company_elem.text.strip() if company_elem else "Company"
-            location = location_elem.text.strip() if location_elem else LOCATION
-            clean_query = query.replace('"', "")
-
-            print(f"--> Found relevant job: {title} at {company}")
-            send_telegram_alert(title, company, location, job_url, clean_query)
-
-          # Add ID so we never re-check it
-          seen_jobs.add(job_id)
-
-    except Exception as e:
-      print(f"Error checking {query}: {e}")
-
-    time.sleep(2)
-
-  save_seen_jobs(seen_jobs)
+    save_seen(seen)
 
 
 if __name__ == "__main__":
-  check_all_roles()
+    sys.exit(main())
